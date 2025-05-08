@@ -1,46 +1,12 @@
 import streamlit as st
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
-import os.path
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+import os
+import jpholiday
 
 # ====================
-# Google カレンダー連携（7日分）
-# ====================
-SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
-
-def get_google_calendar_events():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            'credentials.json', SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-
-    service = build('calendar', 'v3', credentials=creds)
-
-    now = datetime.utcnow().isoformat() + 'Z'
-    week_ahead = (datetime.utcnow() + timedelta(days=7)).isoformat() + 'Z'
-
-    events_result = service.events().list(
-        calendarId='primary',
-        timeMin=now,
-        timeMax=week_ahead,
-        maxResults=20,
-        singleEvents=True,
-        orderBy='startTime'
-    ).execute()
-
-    return events_result.get('items', [])
-
-# ====================
-# 日時・和暦・六曜・第〇〇曜日
+# 日本時間・和暦・六曜・第〇〇曜日
 # ====================
 def get_japan_datetime_info():
     jst = pytz.timezone('Asia/Tokyo')
@@ -79,7 +45,8 @@ def get_japan_datetime_info():
         "和暦": to_wareki(now),
         "時間": now.strftime("%H:%M"),
         "六曜": get_rokuyo(now),
-        "第〇〇曜日": get_nth_weekday(now)
+        "第〇〇曜日": get_nth_weekday(now),
+        "datetime": now
     }
 
 # ====================
@@ -88,22 +55,34 @@ def get_japan_datetime_info():
 def get_gym_status():
     jst = pytz.timezone('Asia/Tokyo')
     now = datetime.now(jst)
-    weekday = now.weekday()
+    weekday = now.weekday()  # 月曜=0, 日曜=6
     hour = now.hour
     minute = now.minute
 
-    if weekday == 6:  # 日曜
+    # 定休日判定：第3月曜日（祝日の場合は営業）
+    if weekday == 0:  # 月曜日
+        day = now.day
+        nth = (day - 1) // 7 + 1
+        if nth == 3 and not jpholiday.is_holiday(now.date()):
+            return "🔴 閉店中（第3月曜日のため定休日）"
+
+    # 営業時間設定
+    if weekday == 6:  # 日曜日
         open_time = 8
         close_time = 21
-    else:
+    else:  # 月～土
         open_time = 7
         close_time = 23
 
+    # 営業中判定
     current_time = hour + minute / 60
-    return "🟢 営業中" if open_time <= current_time < close_time else "🔴 閉店中"
+    if open_time <= current_time < close_time:
+        return "🟢 営業中"
+    else:
+        return "🔴 閉店中"
 
 # ====================
-# LINE通知（セキュリティは環境変数で管理）
+# LINE通知（Secretsから取得）
 # ====================
 LINE_TOKEN = os.getenv("LINE_TOKEN")
 LINE_USER_ID = os.getenv("LINE_USER_ID")
@@ -123,11 +102,11 @@ def notify_line(message):
     requests.post(url, headers=headers, json=data)
 
 # ====================
-# Streamlit表示
+# Streamlit 表示
 # ====================
 st.set_page_config(page_title="神アプリ", layout="centered")
 
-# 日付表示
+# 日付情報表示
 date_info = get_japan_datetime_info()
 st.markdown(f"""
 ### 📅 本日の日付
@@ -138,25 +117,11 @@ st.markdown(f"""
 - {date_info['第〇〇曜日']}
 """)
 
-# ジム営業状況
+# ジム営業状況表示
 gym_status = get_gym_status()
 st.markdown(f"### 🏋️ ゴールドジムさいたまスーパーアリーナの営業状況\n- {gym_status}")
 
-# カレンダー予定表示（7日間）
-st.markdown("### 📆 Googleカレンダー（今後7日間の予定）")
-try:
-    events = get_google_calendar_events()
-    if not events:
-        st.write("今後7日間に予定はありません。")
-    else:
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            summary = event.get('summary', '予定タイトルなし')
-            st.write(f"- {start}：{summary}")
-except Exception as e:
-    st.error(f"Googleカレンダー取得エラー: {e}")
-
-# コメント送信欄（LINEに即送信）
+# コメント欄 → LINE通知
 st.header("💬 コメント欄（Botへ即通知）")
 user_comment = st.text_input("Botに送りたいコメントを入力してください")
 if user_comment:
