@@ -1,16 +1,51 @@
 import streamlit as st
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+import os.path
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
 # ====================
-# 日本時間・和暦・六曜・第〇〇曜日
+# Google カレンダー連携（7日分）
+# ====================
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+
+def get_google_calendar_events():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+
+    service = build('calendar', 'v3', credentials=creds)
+
+    now = datetime.utcnow().isoformat() + 'Z'
+    week_ahead = (datetime.utcnow() + timedelta(days=7)).isoformat() + 'Z'
+
+    events_result = service.events().list(
+        calendarId='primary',
+        timeMin=now,
+        timeMax=week_ahead,
+        maxResults=20,
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+
+    return events_result.get('items', [])
+
+# ====================
+# 日時・和暦・六曜・第〇〇曜日
 # ====================
 def get_japan_datetime_info():
     jst = pytz.timezone('Asia/Tokyo')
     now = datetime.now(jst)
 
-    # 和暦変換
     def to_wareki(dt):
         year = dt.year
         if year >= 2019:
@@ -27,14 +62,12 @@ def get_japan_datetime_info():
             era_year = 0
         return f"{era}{era_year}年{dt.month}月{dt.day}日"
 
-    # 六曜計算（1900/1/1を起点）
     def get_rokuyo(dt):
         base = datetime(1900, 1, 1, tzinfo=jst)
         days = (dt - base).days
         rokuyo_cycle = ["先勝", "友引", "先負", "仏滅", "大安", "赤口"]
         return rokuyo_cycle[days % 6]
 
-    # 第〇〇曜日の取得
     def get_nth_weekday(dt):
         day = dt.day
         nth = (day - 1) // 7 + 1
@@ -55,32 +88,29 @@ def get_japan_datetime_info():
 def get_gym_status():
     jst = pytz.timezone('Asia/Tokyo')
     now = datetime.now(jst)
-    weekday = now.weekday()  # 月曜=0, 日曜=6
+    weekday = now.weekday()
     hour = now.hour
     minute = now.minute
 
-    # 営業時間設定
-    if weekday == 6:  # 日曜日
+    if weekday == 6:  # 日曜
         open_time = 8
         close_time = 21
-    else:  # 月～土
+    else:
         open_time = 7
         close_time = 23
 
-    # 営業中判定
     current_time = hour + minute / 60
-    if open_time <= current_time < close_time:
-        return "🟢 営業中"
-    else:
-        return "🔴 閉店中"
+    return "🟢 営業中" if open_time <= current_time < close_time else "🔴 閉店中"
 
 # ====================
-# LINE通知設定
+# LINE通知（セキュリティは環境変数で管理）
 # ====================
-LINE_TOKEN = 'vYjBW6qH8fpYWpvHSHLgSwp6/L8MqHdmc3z943Ij0XaPJfxJ1uYF0C700yZQeAOkXkrTjG/N4bgwXG2q9V3ZHhDz1RLNzmTa183o3gZR4qlP/C5pBUe/y7DCrdvKRq3+/fwJvv3CJKiKk4Koe4KuHwdB04t89/1O/w1cDnyilFU='
-LINE_USER_ID = 'Ufc5bb2f17427e4c4bf73f1203e598119'
+LINE_TOKEN = os.getenv("LINE_TOKEN")
+LINE_USER_ID = os.getenv("LINE_USER_ID")
 
 def notify_line(message):
+    if not LINE_TOKEN or not LINE_USER_ID:
+        return
     url = 'https://api.line.me/v2/bot/message/push'
     headers = {
         'Content-Type': 'application/json',
@@ -93,11 +123,11 @@ def notify_line(message):
     requests.post(url, headers=headers, json=data)
 
 # ====================
-# Streamlit 表示
+# Streamlit表示
 # ====================
 st.set_page_config(page_title="神アプリ", layout="centered")
 
-# 日付情報表示
+# 日付表示
 date_info = get_japan_datetime_info()
 st.markdown(f"""
 ### 📅 本日の日付
@@ -108,14 +138,27 @@ st.markdown(f"""
 - {date_info['第〇〇曜日']}
 """)
 
-# ゴールドジム営業状況表示
+# ジム営業状況
 gym_status = get_gym_status()
 st.markdown(f"### 🏋️ ゴールドジムさいたまスーパーアリーナの営業状況\n- {gym_status}")
 
-# コメント欄 → LINE通知
+# カレンダー予定表示（7日間）
+st.markdown("### 📆 Googleカレンダー（今後7日間の予定）")
+try:
+    events = get_google_calendar_events()
+    if not events:
+        st.write("今後7日間に予定はありません。")
+    else:
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            summary = event.get('summary', '予定タイトルなし')
+            st.write(f"- {start}：{summary}")
+except Exception as e:
+    st.error(f"Googleカレンダー取得エラー: {e}")
+
+# コメント送信欄（LINEに即送信）
 st.header("💬 コメント欄（Botへ即通知）")
 user_comment = st.text_input("Botに送りたいコメントを入力してください")
-
 if user_comment:
     notify_line(f"📩 コメント通知：\n{user_comment}")
     st.success("Botにコメントを送信しました。")
